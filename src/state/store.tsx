@@ -23,7 +23,9 @@ import {
   type RawSourcePackage,
 } from '../domain/sampleData';
 import type {
+  GeneralizeMode,
   PackageMeta,
+  PublicGeometryVersion,
   RecomputeMode,
   ReleaseSnapshot,
   ReviewDraft,
@@ -32,6 +34,8 @@ import type {
   SyncState,
 } from '../domain/types';
 import type { PipelineResult as PipelineResultType } from '../domain/pipeline';
+import { PUBLIC_POLICIES, buildPublicGeometryVersion } from '../domain/publicGeometry';
+import { internalVersions } from '../domain/publicSample';
 
 export type PipelineResult = PipelineResultType;
 
@@ -55,6 +59,7 @@ interface AppState {
   records: PackageRecord[];
   snapshots: ReleaseSnapshot[];
   drafts: ReviewDraft[];
+  publicVersions: PublicGeometryVersion[];
   sync: SyncState | null;
   activeRule: string;
   lastFingerprints: RuleFingerprints | null;
@@ -77,6 +82,8 @@ type Action =
   | { type: 'notice'; payload: string | null }
   | { type: 'ruleUpdated'; payload: { records: PackageRecord[]; activeRule: string } }
   | { type: 'synced'; payload: { sync: SyncState; drafts: ReviewDraft[] } }
+  | { type: 'publicVersion'; payload: PublicGeometryVersion }
+  | { type: 'publicReset' }
   | { type: 'reset' };
 
 const initialState: AppState = {
@@ -84,6 +91,7 @@ const initialState: AppState = {
   records: [],
   snapshots: [],
   drafts: [],
+  publicVersions: [],
   sync: null,
   activeRule: TOPOLOGY_RULE_VERSION,
   lastFingerprints: null,
@@ -123,6 +131,10 @@ function reducer(state: AppState, action: Action): AppState {
       return { ...state, records: action.payload.records, activeRule: action.payload.activeRule };
     case 'synced':
       return { ...state, sync: action.payload.sync, drafts: action.payload.drafts };
+    case 'publicVersion':
+      return { ...state, publicVersions: [...state.publicVersions, action.payload] };
+    case 'publicReset':
+      return { ...state, publicVersions: [] };
     case 'reset':
       return { ...initialState, ready: true, activeRule: state.activeRule };
     default:
@@ -148,6 +160,8 @@ interface AppApi {
   simulateRuleUpdate: () => Promise<void>;
   simulateServerAdvance: () => Promise<void>;
   runSync: () => Promise<void>;
+  publishPublicVersion: (mode: GeneralizeMode, internalVersionId: string, rollback?: boolean) => Promise<PublicGeometryVersion | null>;
+  clearPublicVersions: () => Promise<void>;
   select: (id: string | null) => void;
   setReviewer: (name: string) => void;
   resetAll: () => Promise<void>;
@@ -167,10 +181,11 @@ export function AppProvider({ children }: { children: ReactNode }) {
 
   useEffect(() => {
     (async () => {
-      const [records, snapshots, drafts, activeRule, lastFingerprints, server, sync] = await Promise.all([
+      const [records, snapshots, drafts, publicVersions, activeRule, lastFingerprints, server, sync] = await Promise.all([
         idbGetAll<PackageRecord>(STORES.packages),
         idbGetAll<ReleaseSnapshot>(STORES.snapshots),
         idbGetAll<ReviewDraft>(STORES.drafts),
+        idbGetAll<PublicGeometryVersion>(STORES.publicVersions),
         kvGet<string>(KV_KEYS.rule),
         kvGet<RuleFingerprints>(KV_KEYS.fingerprints),
         kvGet<ServerState>(KV_KEYS.server),
@@ -182,6 +197,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
           records: records.sort((a, b) => a.meta.importedAt.localeCompare(b.meta.importedAt)),
           snapshots,
           drafts,
+          publicVersions: publicVersions.sort((a, b) => a.publicVersionId.localeCompare(b.publicVersionId)),
           sync: sync ?? null,
           activeRule: activeRule ?? TOPOLOGY_RULE_VERSION,
           lastFingerprints: lastFingerprints ?? null,
@@ -357,7 +373,8 @@ export function AppProvider({ children }: { children: ReactNode }) {
     dispatch({ type: 'notice', payload: `模拟服务器发布版本前进至 v${server.releaseVersion}（终态发布：${server.finalizedIds.join('、') || '无'}）` });
     // 直接刷新内存中的 server 字段
     dispatch({ type: 'ready', payload: {
-      records: state.records, snapshots: state.snapshots, drafts: state.drafts, sync: state.sync,
+      records: state.records, snapshots: state.snapshots, drafts: state.drafts,
+      publicVersions: state.publicVersions, sync: state.sync,
       activeRule: state.activeRule, lastFingerprints: state.lastFingerprints, server,
     } });
   }, [state]);
@@ -376,6 +393,38 @@ export function AppProvider({ children }: { children: ReactNode }) {
     });
   }, [state]);
 
+  // 公开几何版本：两路方案各自派生；内部版本回退时必须生成新的公开差异版本
+  const publishPublicVersion = useCallback(
+    async (mode: GeneralizeMode, internalVersionId: string, rollback = false) => {
+      const existing = (await idbGetAll<PublicGeometryVersion>(STORES.publicVersions)).sort((a, b) =>
+        a.publicVersionId.localeCompare(b.publicVersionId),
+      );
+      const internal = internalVersions().find((v) => v.internalVersionId === internalVersionId) ?? internalVersions()[0];
+      const version = await buildPublicGeometryVersion({
+        internal,
+        policy: PUBLIC_POLICIES[mode],
+        existing,
+        rollback,
+      });
+      await idbPut(STORES.publicVersions, version);
+      dispatch({ type: 'publicVersion', payload: version });
+      dispatch({
+        type: 'notice',
+        payload: `已生成公开几何版本 ${version.publicVersionId}（${
+          mode === 'fixed_grid' ? '固定网格' : '风险自适应'
+        }${rollback ? '，内部回退' : ''}）：待核 ${version.summary.pendingCount} 个，安全区 ${version.summary.safeCount} 个`,
+      });
+      return version;
+    },
+    [],
+  );
+
+  const clearPublicVersions = useCallback(async () => {
+    await idbClear(STORES.publicVersions);
+    dispatch({ type: 'publicReset' });
+    dispatch({ type: 'notice', payload: '公开几何版本账已清空' });
+  }, []);
+
   const select = useCallback((id: string | null) => dispatch({ type: 'select', payload: id }), []);
   const setReviewer = useCallback((name: string) => dispatch({ type: 'reviewer', payload: name }), []);
 
@@ -387,8 +436,8 @@ export function AppProvider({ children }: { children: ReactNode }) {
   }, []);
 
   const api = useMemo<AppApi>(
-    () => ({ state, importAndRun, compareModes, replay, saveDraft, simulateRuleUpdate, simulateServerAdvance, runSync, select, setReviewer, resetAll }),
-    [state, importAndRun, compareModes, replay, saveDraft, simulateRuleUpdate, simulateServerAdvance, runSync, select, setReviewer, resetAll],
+    () => ({ state, importAndRun, compareModes, replay, saveDraft, simulateRuleUpdate, simulateServerAdvance, runSync, publishPublicVersion, clearPublicVersions, select, setReviewer, resetAll }),
+    [state, importAndRun, compareModes, replay, saveDraft, simulateRuleUpdate, simulateServerAdvance, runSync, publishPublicVersion, clearPublicVersions, select, setReviewer, resetAll],
   );
 
   return <AppContext.Provider value={api}>{children}</AppContext.Provider>;

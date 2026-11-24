@@ -246,3 +246,180 @@ export interface SyncState {
   mergedDrafts: string[];
   conflicts: string[];
 }
+
+// ---------------------------------------------------------------------------
+// 公开几何发布：设施探测点、误差包络、禁挖缓冲与字段遮蔽
+// 内部真值（精确坐标、精度、责任人、待核状态）只留在内部账，公开账只登记派生结果。
+// ---------------------------------------------------------------------------
+
+/** 待复核状态：定位误差包络是否覆盖点位，是否需要现场复核 */
+export type VerifyState = 'pending' | 'verified';
+
+/** 内部设施探测点真值（严禁直接出现在公开账中） */
+export interface DetectionPointTruth {
+  id: string;
+  facility: string; // 设施类别（公开描述可用，责任人与精度不可）
+  /** 内部控制坐标（米），`revealAtM` 之外不得公开 */
+  coord: Point;
+  /** 定位误差（米，半宽），探测精度 */
+  errorM: number;
+  verifyState: VerifyState;
+  /** 内部责任人 / 台账持有人 */
+  owner: string;
+  internalNote: string;
+}
+
+/** 内部沟槽（施工开挖）真值：折线边线 + 沟槽宽度 */
+export interface TrenchTruth {
+  id: string;
+  /** 沟槽中心线（内部坐标） */
+  centerline: Geometry;
+  widthM: number;
+  bufferM: number; // 禁挖缓冲距离，样例 3 米
+  zone: string;
+}
+
+/** 公开网格泛化方案 */
+export type GeneralizeMode = 'fixed_grid' | 'risk_adaptive';
+
+/** 公开发布策略：固定比例尺网格泛化 或 按施工风险自适应模糊 */
+export interface PublicZonePolicy {
+  mode: GeneralizeMode;
+  /** 固定网格边长（米），仅 fixed_grid 使用 */
+  cellM: number;
+  /** 自适应：高风险带（包络与缓冲相交风险）保留的细网格边长（米） */
+  fineCellM: number;
+  /** 自适应：远离缓冲处的粗网格边长（米） */
+  coarseCellM: number;
+  /** 自适应：判定为高风险的净距阈值（米），= bufferM + 最大误差包络 */
+  riskMarginM: number;
+  /** 统一的最小公开精度（米），避免不同设施精度不同导致可比对反推 */
+  uniformPrecisionM: number;
+}
+
+/** 公开误差包络：以泛化后中心与放大后的半宽给出，保守且不含原始坐标 */
+export interface PublicEnvelope {
+  /** 泛化单元中心（已量化到公开网格） */
+  center: Point;
+  /** 泛化单元边长（米） */
+  cellM: number;
+  /** 对外公布的半宽 = 单元半对角线 + 统一包络冗余（不随单点精度变化） */
+  halfWidthM: number;
+  /** 该包络来源：网格泛化 / 风险自适应 */
+  basis: GeneralizeMode;
+  /** 风险档位（粗粒度，避免由包络反推出内部净距） */
+  riskClass: 'high' | 'low';
+}
+
+/** 风险档位判定依据（内部审计，不进入公开视图） */
+export interface PublicRiskAudit {
+  pointId: string;
+  riskClass: 'high' | 'low';
+  criterion: string;
+  /** 内部净距（米），仅审计用 */
+  internalClearanceM: number;
+}
+
+/** 隐藏字段记录：哪个字段、为何被遮蔽、遮蔽后可见形式 */
+export interface MaskingRecord {
+  subjectId: string; // DP-xx
+  field: string; // 'coord' | 'errorM' | 'owner' | 'verifyState' | 'internalNote'
+  reason: string;
+  visibleForm: string; // 公开账中实际可见的形式
+  blocked: boolean; // 是否必须阻断（原始坐标/精度/责任人一律 block）
+}
+
+/** 单个设施探测点的公开判定 */
+export interface PublicPointVerdict {
+  pointId: string;
+  facility: string;
+  envelope: PublicEnvelope;
+  /** 包络到 3 米禁挖缓冲外沿的最近距离（米）；负值表示包络进入缓冲带 */
+  envelopeToBufferM: number;
+  /** 包络是否与缓冲带相交（相交=施工方只能得到“可能相交”） */
+  intersectsBuffer: boolean;
+  /** 公开侧能得到的结论（仅由包络相交判定，不依赖内部待核状态） */
+  publicConclusion: 'safe_zone' | 'possibly_intersects';
+  /** 是否阻断精确位置发布 */
+  exactBlocked: boolean;
+  notes: string[];
+}
+
+/** 内部与公开的差异验收（逐点比较） */
+export interface AcceptanceRow {
+  pointId: string;
+  /** 内部真值：估计点到沟槽边线的距离（米） */
+  internalEdgeDistanceM: number;
+  /** 内部真值：点到缓冲外沿的距离（米），负=已在缓冲内 */
+  internalClearanceM: number;
+  /** 内部误差包络到缓冲外沿的余量（米），验证样例 2.6–4.2 米跨缓冲 */
+  internalEnvelopeMarginM: number;
+  /** 公开包络到缓冲外沿的最近距离（米） */
+  envelopeClearanceM: number;
+  /** 内部点是否在缓冲内 */
+  internalInside: boolean;
+  /** 公开包络是否与缓冲相交 */
+  publicIntersects: boolean;
+  /** 泛化位移（米）：公开中心与内部坐标距离，验证不泄露精确坐标 */
+  generalizationShiftM: number;
+  /** 公开包络半宽是否不小于误差 + 精度（保守性） */
+  conservative: boolean;
+  /** 结论方向是否一致（包络相交应覆盖内部穿越/待核） */
+  consistent: boolean;
+  /** 是否存在精确坐标泄露 */
+  leaksExact: boolean;
+  note: string;
+}
+
+/** 公开版本相对前一版本的差异（回退时用于生成公开差异版本） */
+export interface PublicVersionDiff {
+  comparedTo: string | null;
+  added: string[];
+  removed: string[];
+  changed: {
+    pointId: string;
+    fromConclusion: PublicPointVerdict['publicConclusion'];
+    toConclusion: PublicPointVerdict['publicConclusion'];
+    fromHalfWidthM: number;
+    toHalfWidthM: number;
+  }[];
+}
+
+/** 一条公开几何版本的完整登记 */
+export interface PublicGeometryVersion {
+  publicVersionId: string; // PG-... 不含“最新”标记，回退会生成新号
+  basedOnInternalVersion: string; // 所依据的内部版本号
+  derivedFromPublicId: string | null; // 回退时指向前一个公开版本
+  mode: GeneralizeMode;
+  policy: PublicZonePolicy;
+  bufferM: number;
+  envelopeVersion: string; // 误差包络规则版本
+  verdicts: PublicPointVerdict[];
+  maskingRecords: MaskingRecord[];
+  acceptance: AcceptanceRow[];
+  /** 风险自适应依据（内部审计，公开视图会剥离） */
+  riskBasis: PublicRiskAudit[];
+  /** 相对前一公开版本的差异（回退时体现“新的公开差异版本”） */
+  diff: PublicVersionDiff;
+  /** 是否因回退生成（回退必须生成新的公开差异版本） */
+  regeneratedFromRollback: boolean;
+  /** 公开账保留的内部关联仅做审计哈希，不含原始坐标 */
+  truthRefHash: string;
+  createdAt: string;
+  summary: {
+    safeCount: number;
+    pendingCount: number;
+    blockedExactCount: number;
+    acceptanceFailures: number;
+  };
+  notes: string[];
+}
+
+/** 内部几何版本（供回退演示；不直接公开） */
+export interface InternalGeometryVersion {
+  internalVersionId: string; // IG-v1 / IG-v2
+  label: string;
+  trench: TrenchTruth;
+  points: DetectionPointTruth[];
+  createdAt: string;
+}

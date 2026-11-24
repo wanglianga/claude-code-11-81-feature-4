@@ -10,6 +10,7 @@ import { ImpactPage } from './pages/ImpactPage';
 import { RecomputePage } from './pages/RecomputePage';
 import { ReleasePage } from './pages/ReleasePage';
 import { SyncPage } from './pages/SyncPage';
+import { PublicGeometryPage } from './pages/PublicGeometryPage';
 
 const NAV = [
   { key: 'import', label: '① 导入与语义核验' },
@@ -22,6 +23,7 @@ const NAV = [
   { key: 'recompute', label: '⑧ 重算比较' },
   { key: 'release', label: '⑨ 发布审阅' },
   { key: 'sync', label: '⑩ 离线失效与同步' },
+  { key: 'publicgeom', label: '⑪ 公开几何发布' },
 ] as const;
 
 type NavKey = (typeof NAV)[number]['key'];
@@ -80,6 +82,7 @@ export default function App() {
         {tab === 'recompute' && <RecomputePage />}
         {tab === 'release' && <ReleasePage />}
         {tab === 'sync' && <SyncPage />}
+        {tab === 'publicgeom' && <PublicGeometryPage />}
       </main>
       {toast && <div className="toast">{toast}</div>}
     </>
